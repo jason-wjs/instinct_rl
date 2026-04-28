@@ -99,7 +99,9 @@ class OnPolicyRunner:
 
         # Log
         self.log_dir = log_dir
+        self.logger_names = self._parse_logger_names(self.cfg.get("logger", "tensorboard"))
         self.writer = None
+        self.wandb_run = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
@@ -115,8 +117,7 @@ class OnPolicyRunner:
             self.alg.distributed_data_parallel()
             print(f"[INFO rank {dist.get_rank()}]: DistributedDataParallel enabled.")
         # initialize writer
-        if self.log_dir is not None and self.writer is None and (not self.is_mp_rank_other_process()):
-            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+        self.init_writers()
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
@@ -276,8 +277,8 @@ class OnPolicyRunner:
                     value = self.gather_stat_values(infotensor, "min")
                 else:
                     value = self.gather_stat_values(infotensor, "mean")
-                if len(texts) > 0 and (not self.is_mp_rank_other_process()):
-                    self.writer.add_text(
+                if len(texts) > 0:
+                    self.writer_mp_add_text(
                         (key if key.startswith("Step") else "Step/" + key),
                         "\n".join(texts),
                         self.current_learning_iteration,
@@ -423,6 +424,7 @@ class OnPolicyRunner:
             }
         )
         torch.save(run_state_dict, path)
+        self._log_wandb_checkpoint(path)
 
     def load(self, path):
         """Load training state dict from file. Will not happen if in multi-process and not rank 0."""
@@ -529,10 +531,128 @@ class OnPolicyRunner:
             raise ValueError(f"Unsupported gather_op: {gather_op}")
         return values
 
+    def _parse_logger_names(self, logger):
+        if logger is None:
+            return {"tensorboard"}
+        if isinstance(logger, str):
+            raw_names = logger.replace("+", ",").replace(";", ",").split(",")
+        else:
+            raw_names = list(logger)
+
+        logger_names = set()
+        for raw_name in raw_names:
+            name = str(raw_name).strip().lower()
+            if name in ("", "none", "disabled"):
+                continue
+            if name == "tb":
+                name = "tensorboard"
+            if name in ("all", "tensorboard_wandb", "wandb_tensorboard"):
+                logger_names.update({"tensorboard", "wandb"})
+            else:
+                logger_names.add(name)
+
+        unsupported_loggers = logger_names.difference({"tensorboard", "wandb"})
+        if unsupported_loggers:
+            raise ValueError(f"Unsupported logger(s): {sorted(unsupported_loggers)}")
+        return logger_names
+
+    def init_writers(self):
+        """Initialize configured log writers on the main process."""
+        if self.log_dir is None or self.is_mp_rank_other_process():
+            return
+        if "tensorboard" in self.logger_names and self.writer is None:
+            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+        if "wandb" in self.logger_names and self.wandb_run is None:
+            self.wandb_run = self._init_wandb()
+
+    def _init_wandb(self):
+        try:
+            wandb = importlib.import_module("wandb")
+        except ImportError as exc:
+            raise ImportError(
+                "W&B logging requested, but wandb is not installed. Install wandb or set logger to tensorboard."
+            ) from exc
+
+        wandb_kwargs = {
+            "project": self.cfg.get("wandb_project") or self.cfg.get("experiment_name") or "instinct_rl",
+            "dir": self.log_dir,
+            "config": self.cfg,
+        }
+        wandb_name = self.cfg.get("wandb_name") or self.cfg.get("run_name")
+        if not wandb_name and self.log_dir:
+            wandb_name = os.path.basename(os.path.normpath(self.log_dir))
+        if wandb_name:
+            wandb_kwargs["name"] = wandb_name
+
+        for cfg_key, wandb_key in (
+            ("wandb_entity", "entity"),
+            ("wandb_mode", "mode"),
+            ("wandb_tags", "tags"),
+            ("wandb_group", "group"),
+            ("wandb_job_type", "job_type"),
+            ("wandb_notes", "notes"),
+            ("wandb_id", "id"),
+            ("wandb_resume", "resume"),
+        ):
+            value = self.cfg.get(cfg_key)
+            if value is not None:
+                wandb_kwargs[wandb_key] = value
+
+        return wandb.init(**wandb_kwargs)
+
+    def _wandb_value(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu()
+        return value
+
+    def _wandb_step(self, step):
+        if isinstance(step, int):
+            return step
+        return self.current_learning_iteration
+
+    def _wandb_artifact_name(self):
+        artifact_name = self.cfg.get("wandb_checkpoint_artifact_name")
+        if artifact_name:
+            return artifact_name
+        run_id = getattr(self.wandb_run, "id", None) or getattr(self.wandb_run, "name", None) or "run"
+        return "checkpoint-" + "".join(
+            char if char.isalnum() or char in "-_." else "-" for char in str(run_id)
+        )
+
+    def _log_wandb_checkpoint(self, path):
+        if self.wandb_run is None or not self.cfg.get("wandb_log_model", True):
+            return
+
+        wandb = importlib.import_module("wandb")
+        artifact = wandb.Artifact(
+            name=self._wandb_artifact_name(),
+            type=self.cfg.get("wandb_checkpoint_artifact_type", "model"),
+        )
+        artifact.add_file(path, name=os.path.basename(path))
+        self.wandb_run.log_artifact(
+            artifact,
+            aliases=["latest", f"iter-{self.current_learning_iteration}"],
+        )
+
     def writer_mp_add_scalar(self, key, value, step):
-        """Add scalar to tensorboard writer. Will not happen if in multi-process and not rank 0."""
-        if not self.is_mp_rank_other_process():
+        """Add scalar to configured writers. Will not happen if in multi-process and not rank 0."""
+        if self.is_mp_rank_other_process():
+            return
+        if self.writer is not None:
             self.writer.add_scalar(key, value, step)
+        if self.wandb_run is not None:
+            self.wandb_run.log({key: self._wandb_value(value)}, step=self._wandb_step(step))
+
+    def writer_mp_add_text(self, key, value, step):
+        """Add text to configured writers. Will not happen if in multi-process and not rank 0."""
+        if self.is_mp_rank_other_process():
+            return
+        if self.writer is not None:
+            self.writer.add_text(key, value, step)
+        if self.wandb_run is not None:
+            self.wandb_run.log({key: value}, step=self._wandb_step(step))
 
     def train_mode(self):
         """Change all related models into training mode (for dropout for example)"""
